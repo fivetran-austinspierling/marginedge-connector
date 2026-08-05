@@ -107,8 +107,8 @@ The connector performs the following actions for each key aspect:
 - 400 Bad Request: raised immediately (malformed request parameters are not silently skipped)
 - 403 Forbidden: raised immediately and aborts the sync (invalid API key, or the restaurant unit is not authorized for this key) - not retried
 - 404 Not Found: logged and the specific record is skipped (e.g., an order detail lookup for an order ID that no longer resolves)
-- 429 Too Many Requests / 5xx: retried with capped exponential backoff (base 1s, up to 5 attempts, capped at 60s), since MarginEdge does not document a `Retry-After` header
-- A fixed ~150ms delay is added before every request as a defensive courtesy against undocumented rate limits
+- 429 Too Many Requests / 5xx: retried per-call, honoring the `Retry-After` header when the response includes one, otherwise capped exponential backoff (base 1s, up to 5 attempts, capped at 60s)
+- Adaptive request pacing: every 429 also raises the steady-state delay applied before *every* request (starting at ~150ms, capped at 5s), not just retries of the throttled call. Real-world testing showed that a fixed 150ms delay is too aggressive for large product catalogs once the per-product fan-out (`product_units`, `product_price_history`, `vendor_items_by_product`) multiplies call volume - the connector now settles into a slower sustained rate for the rest of that sync run once it detects it's being throttled, instead of immediately reverting to the aggressive default and re-triggering the same 429s on the very next call
 
 Uses Fivetran SDK logging levels (`log.info`, `log.debug`, `log.warning`, `log.error`) for detailed sync visibility.
 

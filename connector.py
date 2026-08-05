@@ -60,8 +60,19 @@ __REQUEST_TIMEOUT = 30  # seconds
 __MAX_RETRIES = 5
 __BASE_DELAY = 1  # seconds, base for exponential backoff
 __MAX_DELAY = 60  # seconds, cap for exponential backoff
-__REQUEST_DELAY = 0.15  # seconds, defensive fixed delay between every request
+__REQUEST_DELAY = 0.15  # seconds, starting fixed delay between every request
+__MAX_REQUEST_DELAY = 5.0  # seconds, cap for the adaptive steady-state delay below
 __ORDER_WINDOW_DAYS = 30  # size of each incremental orders date window
+
+# Mutable, module-level (not persisted in sync state - resets every sync run):
+# tracks the current steady-state delay applied before every request. Plain
+# per-call exponential backoff (below) only slows down retries of the call
+# that got throttled; it does nothing for the next, unrelated call, so a
+# sustained burst of 429s (e.g. the large per-product fan-out) just keeps
+# re-triggering the same throttling. Every 429 nudges this delay up so the
+# connector settles into a slower sustained rate instead of immediately
+# reverting to the aggressive default.
+_PACING = {"delay": __REQUEST_DELAY}
 
 
 def validate_configuration(configuration: dict):
@@ -94,17 +105,38 @@ def _is_retryable_status(status_code: int) -> bool:
     return status_code == 429 or 500 <= status_code < 600
 
 
+def _retry_after_seconds(response) -> float:
+    """Return the `Retry-After` header value in seconds if present and valid, else None.
+
+    MarginEdge doesn't document sending this header, but it costs nothing to
+    check - if the AWS API Gateway throttle does send it, it's a more
+    accurate wait time than a blind exponential guess.
+    """
+    value = response.headers.get("Retry-After")
+    if value is None:
+        return None
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        return None
+
+
 def _get(configuration: dict, path: str, params: dict = None):
     """Issue a single GET request to the MarginEdge API with retry/backoff handling.
 
-    - 429 and 5xx responses are retried with capped exponential backoff
-      (base 1s, up to __MAX_RETRIES retries, capped at __MAX_DELAY seconds).
+    - 429 and 5xx responses are retried, honoring the `Retry-After` header
+      when present, otherwise using capped exponential backoff (base 1s, up
+      to __MAX_RETRIES retries, capped at __MAX_DELAY seconds).
+    - Every 429 also raises the shared `_PACING["delay"]` (see module-level
+      comment) so subsequent, unrelated requests slow down too - not just
+      retries of the throttled call - since a sustained burst of 429s means
+      the steady-state rate itself is too fast, not just this one request.
     - 403 responses raise immediately (invalid key or restaurant unit not
       authorized for this key) - this is not retryable.
     - 400 responses raise immediately (malformed request params) rather than
       being silently skipped.
     - 404 responses return None so the caller can log-and-skip that record.
-    - A small fixed delay is applied before every request as a defensive
+    - `_PACING["delay"]` is applied before every request as a defensive
       courtesy since MarginEdge does not document a numeric rate limit.
 
     Args:
@@ -121,7 +153,7 @@ def _get(configuration: dict, path: str, params: dict = None):
     attempt = 0
 
     while True:
-        time.sleep(__REQUEST_DELAY)
+        time.sleep(_PACING["delay"])
         try:
             response = rq.get(url, headers=headers, params=params, timeout=__REQUEST_TIMEOUT)
         except (rq.exceptions.ConnectionError, rq.exceptions.Timeout) as exc:
@@ -150,13 +182,20 @@ def _get(configuration: dict, path: str, params: dict = None):
             return None
 
         if _is_retryable_status(response.status_code):
+            if response.status_code == 429 and _PACING["delay"] < __MAX_REQUEST_DELAY:
+                _PACING["delay"] = min(__MAX_REQUEST_DELAY, _PACING["delay"] * 1.5)
+                log.info(f"Raised steady-state request pacing to {_PACING['delay']:.2f}s after a 429")
+
             if attempt >= __MAX_RETRIES:
                 log.error(f"Exhausted retries calling {path}: HTTP {response.status_code}")
                 response.raise_for_status()
-            delay = min(__MAX_DELAY, __BASE_DELAY * (2 ** attempt))
+
+            retry_after = _retry_after_seconds(response)
+            delay = retry_after if retry_after is not None else min(__MAX_DELAY, __BASE_DELAY * (2 ** attempt))
             log.warning(
                 f"HTTP {response.status_code} calling {path}, retrying in {delay}s "
-                f"(attempt {attempt + 1}/{__MAX_RETRIES})"
+                f"(attempt {attempt + 1}/{__MAX_RETRIES}"
+                f"{', honoring Retry-After' if retry_after is not None else ''})"
             )
             time.sleep(delay)
             attempt += 1
