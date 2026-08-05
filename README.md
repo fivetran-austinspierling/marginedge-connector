@@ -4,7 +4,7 @@
 
 This is a custom [Fivetran connector](https://fivetran.com/docs/connectors/connector-sdk) implementation to extract and sync data from the [MarginEdge Public API](https://api.marginedge.com/public) into a destination warehouse. MarginEdge is a back-of-house restaurant operations platform providing invoicing, inventory, vendor, and product data.
 
-> **Note on API documentation:** This connector was built from a third-party OpenAPI mirror of the MarginEdge Public API, because the official MarginEdge documentation site blocked automated fetch during code generation. In particular, the `orders` date-filter semantics (`createdDate` vs. `invoiceDate`) and the exact `orderStatus` enum values are **unverified** against live docs. This connector intentionally omits the `orderStatus` filter (it syncs all orders regardless of status) and treats `createdDate` as the incremental cursor field. Confirm both details against a live MarginEdge account during local testing with real credentials before relying on this connector in production.
+> **Note on API documentation:** This connector was originally built from a third-party OpenAPI mirror of the MarginEdge Public API (the official docs site blocked automated fetch during code generation), then cross-checked against MarginEdge's official Postman collection, which confirmed field names and response shapes for every table. Two details remain **unverified** against live docs: the `orders` date-filter semantics (`createdDate` vs. `invoiceDate`) and the exact `orderStatus` enum values. This connector intentionally omits the `orderStatus` filter (it syncs all orders regardless of status) and treats `createdDate` as the incremental cursor field. Confirm both during local testing with real credentials before relying on this connector in production.
 
 ## Requirements
 
@@ -31,19 +31,21 @@ Refer to the [Connector SDK Setup Guide](https://fivetran.com/docs/connectors/co
 
 ## Local testing checklist
 
-Because this connector was built from a third-party API mirror rather than MarginEdge's official docs (see the note at the top of this file), please verify the following while running `fivetran debug` and report back what you find — logs and record counts only, **never** the API key itself:
+Please verify the following while running `fivetran debug` and report back what you find — logs and record counts only, **never** the API key itself:
 
 - [ ] Sync completes without unhandled errors (a 403 will abort the whole sync by design — see [Error handling](#error-handling))
-- [ ] `orders` rows look correct for a known date range — in particular, confirm whether MarginEdge's `startDate`/`endDate` filter (and thus this connector's incremental cursor) should be based on `createdDate` or `invoiceDate`. Compare a few orders' dates against what you see in the MarginEdge UI for that same window.
-- [ ] `order_attachments.attachment_url` and `attachment_id` are actually populated with the field names this connector expects (`attachmentUrl`/`attachmentId`) — if they come back empty/null on orders you know have attachments, the real field names differ and the code needs a small update.
-- [ ] Row counts across `restaurant_units`, `products`, `vendors`, `categories` roughly match what you'd expect from the account being tested (confirms the `restaurantUnitId` fan-out is discovering everything it should).
-- [ ] Re-run `fivetran debug` a second time and confirm the `orders` incremental logic doesn't re-sync the entire history (checkpointed state should pick up from where it left off).
+- [ ] Every table gets rows, not just `restaurant_units` — an earlier version of this connector had a bug where every list endpoint returned zero rows despite the API responding correctly (wrong assumption about how the response was wrapped); that's now fixed, but worth confirming broadly on your first real run
+- [ ] `orders` rows look correct for a known date range — in particular, confirm whether MarginEdge's `startDate`/`endDate` filter (and thus this connector's incremental cursor) should be based on `createdDate` or `invoiceDate`. Compare a few orders' dates against what you see in the MarginEdge UI for that same window
+- [ ] Row counts across `restaurant_units`, `products`, `vendors`, `categories` roughly match what you'd expect from the account being tested (confirms the `restaurantUnitId` fan-out is discovering everything it should)
+- [ ] Note how long the initial sync takes — the per-product fan-out (`product_units`, `product_price_history`, `vendor_items_by_product`) roughly triples the API call count for large product catalogs, so first-run duration is worth watching on accounts with many products
+- [ ] Re-run `fivetran debug` a second time and confirm the `orders` incremental logic doesn't re-sync the entire history (checkpointed state should pick up from where it left off)
 
 ## Features
 
-- Discovers restaurant units at runtime (`GET /restaurantUnits`) and fans that list out to every restaurant-scoped endpoint (orders, products, vendors, categories), so it never needs a restaurant unit ID supplied in configuration
-- Further fans out from vendors to vendor items, and from vendor items to vendor item packaging
+- Discovers restaurant units at runtime (`GET /restaurantUnits`) and fans that list out to every restaurant-scoped endpoint (orders, products, vendors, categories, countsheets, inventories, recipes, profit & loss and sales reports), so it never needs a restaurant unit ID supplied in configuration
+- Further fans out from vendors to vendor items, and from vendor items to vendor item packaging; and from products to product units, product price history, and vendor-items-by-product
 - Incremental sync of `orders` via monthly date windows and per-restaurant-unit checkpointed state; all other tables are full-refreshed each run since they are not date-filterable
+- Deliberately excludes MarginEdge's async `/exports/*` job endpoints (orders/products/vendor-items/usage/recipes/recipeIngredients/recipeCostHistories exports) - submitting an export is a side-effecting POST that creates a job on the client's account rather than a pure read, and the downloaded file's schema (especially for `usage`, which has no direct GET equivalent) is undocumented
 - Cursor-based (`nextPage`) pagination on every list endpoint
 - Order detail enrichment merged into the same `orders` row, plus nested `lineItems` and `attachments` flattened into child tables
 - Graceful handling of authentication and transient errors: retries with capped exponential backoff on 429/5xx, immediate failure on 403, skip-and-log on 404, raise on 400
@@ -135,9 +137,36 @@ Uses Fivetran SDK logging levels (`log.info`, `log.debug`, `log.warning`, `log.e
 ### Categories
 - `categories`
 
+### Product fan-out (per product, on top of `products`/`product_categories` above)
+- `product_units` - unit conversions per product; no natural unique field, synthetic `unit_index` primary key component
+- `product_price_history` - paginated price history per product; synthetic `price_history_index` primary key component (running index across pages, since `unitName`+`date` can collide across units)
+- `vendor_items_by_product` - vendor items linked to a product (keyed by the more granular `vendorItemId`, distinct from `vendorItemCode` used under Vendors)
+- `vendor_item_conversions` (child of `vendor_items_by_product`; synthetic `conversion_index` primary key component)
+
+### Countsheets
+- `countsheets`
+- `countsheet_sections` (fanned out per countsheet via its detail endpoint)
+
+### Inventories
+- `inventories`
+- `inventory_sections` (fanned out per inventory)
+- `inventory_section_items` (fanned out per section)
+- `inventory_section_item_product_codes` (child of section items; synthetic `code_index` primary key component)
+
+### Recipes
+- `recipe_types`
+- `recipes`
+- `recipe_ingredients` - fetched once per restaurant unit across all recipes (no per-recipe fan-out)
+- `recipe_conversions` - fetched once per restaurant unit across all recipes
+- `recipe_cost_histories` - keyed by `(restaurant_unit_id, recipe_id, recorded_date)`, since this resource has no dedicated ID field
+
+### Reports (single-shot per restaurant unit, covering `initial_sync_start` through today)
+- `profit_and_loss_reports`, `profit_and_loss_report_categories`, `profit_and_loss_report_category_items` (nested inside each category), `profit_and_loss_report_section_items` (section-level items, sibling to categories - a distinct shape from the category-nested items)
+- `sales_reports`, `sales_report_categories`
+
 ## Additional considerations
 
-The examples provided are intended to help you effectively use Fivetran's Connector SDK. While we've tested the code structure, Fivetran cannot be held responsible for any unexpected or negative consequences that may arise from using these examples. Because this connector was generated from a third-party API mirror rather than MarginEdge's official docs, test thoroughly against a real MarginEdge account - in particular the `orders` date-filter/cursor field and the `attachments[]` field names noted above - before deploying to production. For inquiries, please reach out to our Support team.
+The examples provided are intended to help you effectively use Fivetran's Connector SDK. While we've tested the code structure, Fivetran cannot be held responsible for any unexpected or negative consequences that may arise from using these examples. Field names and response shapes have been cross-checked against MarginEdge's official Postman collection, but test thoroughly against a real MarginEdge account - in particular the `orders` date-filter/cursor field noted above - before deploying to production. For inquiries, please reach out to our Support team.
 
 ## Resources
 

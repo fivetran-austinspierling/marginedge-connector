@@ -5,24 +5,43 @@ Public API (https://api.marginedge.com/public) into a destination warehouse.
 MarginEdge is a back-of-house restaurant operations platform (invoicing,
 inventory, vendor management).
 
-IMPORTANT - UNVERIFIED DETAILS:
-This connector was built from a third-party OpenAPI mirror of the MarginEdge
-Public API. MarginEdge's official documentation site blocked automated fetch
-during code generation, so the following details could NOT be confirmed
-against live docs and MUST be verified during local testing with real
-credentials before relying on this connector in production:
-  - Whether `GET /orders` filters by `createdDate` vs. `invoiceDate` (this
-    connector assumes `createdDate` is both the filter semantics for
-    `startDate`/`endDate` and the incremental cursor field).
+This connector was originally built from a third-party OpenAPI mirror of the
+MarginEdge Public API (MarginEdge's official docs site blocked automated
+fetch during code generation), and was later cross-checked against the
+official MarginEdge Postman collection. That confirmed:
+  - List endpoints wrap their array under an endpoint-specific key (e.g.
+    `restaurants`, `orders`, `vendorItems`, `packagings`), not a generic
+    `data` key or a bare array. `_extract_list()` picks the first list-typed
+    value in the response body to handle this uniformly.
+  - The `attachments[]` field names on order detail (`attachmentId` /
+    `attachmentUrl`) are correct as originally guessed.
+
+STILL UNVERIFIED - confirm during live testing:
+  - Whether `GET /orders` `startDate`/`endDate` filters by `createdDate` vs.
+    `invoiceDate` (this connector assumes `createdDate` for both the filter
+    semantics and the incremental cursor field).
   - The exact `orderStatus` enum values. This connector intentionally omits
     the `orderStatus` filter entirely and syncs all orders regardless of
     status, so this uncertainty should not affect correctness, only means
     status-based filtering is unavailable.
-  - The exact JSON field names for `attachments[]` entries on order detail
-    (`attachmentId` / `attachmentUrl` are best-guess names).
-  - Whether list endpoints wrap results in a `data` array alongside the
-    `nextPage` cursor, or return a bare array. This connector handles both
-    shapes defensively (see `_extract_list`).
+
+IMPLEMENTED (previously listed here as a scope gap): the official Postman
+collection revealed additional MarginEdge resources beyond the original 14
+tables, and these have now been implemented: product units, product price
+history, count sheets (+ sections), inventories (+ sections, items, product
+codes), recipe types, recipes, recipe ingredients, recipe conversions, recipe
+cost histories, profit & loss reports (+ category and section-item child
+tables), sales reports (+ category child table), and vendor-items-by-product
+(+ conversions child table).
+
+INTENTIONALLY EXCLUDED - the async export-job endpoints under `/exports/*`
+(orders, products, vendor-items, usage, recipes, recipeIngredients,
+recipeCostHistories) are deliberately NOT implemented. Submitting an export is
+a side-effecting POST that creates an async job on the client's MarginEdge
+account rather than performing a pure read, and the schema of the resulting
+downloaded file - especially for `usage`, which has no direct GET equivalent
+at all - is undocumented in the Postman collection. This is a deliberate
+scope exclusion, not an oversight.
 
 See README.md for setup instructions.
 """
@@ -150,16 +169,24 @@ def _get(configuration: dict, path: str, params: dict = None):
 def _extract_list(body) -> list:
     """Normalize a MarginEdge list-endpoint response body into a list of records.
 
-    Handles both a bare JSON array and an object wrapping the array under a
-    `data` key (the exact wrapper shape is not fully documented, so both are
-    supported defensively).
+    Confirmed against both the OpenAPI spec and the official MarginEdge Postman
+    collection: every list endpoint wraps its array under an endpoint-specific
+    key (e.g. `restaurants`, `orders`, `vendorItems`, `packagings`) rather than
+    a generic `data` key or a bare array, and the wrapper key differs per
+    endpoint. Every observed response has at most one list-valued top-level
+    key (aside from the `nextPage` cursor string), so picking the first
+    list-typed value works uniformly across all endpoints without needing a
+    per-endpoint key map.
     """
     if body is None:
         return []
     if isinstance(body, list):
         return body
     if isinstance(body, dict):
-        return body.get("data") or []
+        for value in body.values():
+            if isinstance(value, list):
+                return value
+        return []
     return []
 
 
@@ -259,6 +286,90 @@ def schema(configuration: dict):
             "primary_key": ["restaurant_unit_id", "vendor_id", "vendor_item_code", "packaging_id"],
         },
         {"table": "categories", "primary_key": ["restaurant_unit_id", "category_id"]},
+        {
+            "table": "product_units",
+            "primary_key": ["restaurant_unit_id", "company_concept_product_id", "unit_index"],
+        },
+        {
+            "table": "product_price_history",
+            "primary_key": ["restaurant_unit_id", "company_concept_product_id", "price_history_index"],
+        },
+        {
+            "table": "vendor_items_by_product",
+            "primary_key": ["restaurant_unit_id", "company_concept_product_id", "vendor_item_id"],
+        },
+        {
+            "table": "vendor_item_conversions",
+            "primary_key": [
+                "restaurant_unit_id",
+                "company_concept_product_id",
+                "vendor_item_id",
+                "conversion_index",
+            ],
+        },
+        {"table": "countsheets", "primary_key": ["restaurant_unit_id", "countsheet_id"]},
+        {
+            "table": "countsheet_sections",
+            "primary_key": ["restaurant_unit_id", "countsheet_id", "section_id"],
+        },
+        {"table": "inventories", "primary_key": ["restaurant_unit_id", "inventory_id"]},
+        {
+            "table": "inventory_sections",
+            "primary_key": ["restaurant_unit_id", "inventory_id", "section_id"],
+        },
+        {
+            "table": "inventory_section_items",
+            "primary_key": ["restaurant_unit_id", "inventory_id", "section_id", "item_id"],
+        },
+        {
+            "table": "inventory_section_item_product_codes",
+            "primary_key": [
+                "restaurant_unit_id",
+                "inventory_id",
+                "section_id",
+                "item_id",
+                "code_index",
+            ],
+        },
+        {"table": "recipe_types", "primary_key": ["restaurant_unit_id", "recipe_type_id"]},
+        {"table": "recipes", "primary_key": ["restaurant_unit_id", "recipe_id"]},
+        {"table": "recipe_ingredients", "primary_key": ["restaurant_unit_id", "ingredient_id"]},
+        {
+            "table": "recipe_conversions",
+            "primary_key": ["restaurant_unit_id", "recipe_conversion_id"],
+        },
+        {
+            "table": "recipe_cost_histories",
+            "primary_key": ["restaurant_unit_id", "recipe_id", "recorded_date"],
+        },
+        {
+            "table": "profit_and_loss_reports",
+            "primary_key": ["restaurant_unit_id", "start_date", "end_date"],
+        },
+        {
+            "table": "profit_and_loss_report_categories",
+            "primary_key": ["restaurant_unit_id", "start_date", "end_date", "section", "category_id"],
+        },
+        {
+            "table": "profit_and_loss_report_category_items",
+            "primary_key": [
+                "restaurant_unit_id",
+                "start_date",
+                "end_date",
+                "section",
+                "category_id",
+                "item_index",
+            ],
+        },
+        {
+            "table": "profit_and_loss_report_section_items",
+            "primary_key": ["restaurant_unit_id", "start_date", "end_date", "section", "item_index"],
+        },
+        {"table": "sales_reports", "primary_key": ["restaurant_unit_id", "start_date", "end_date"]},
+        {
+            "table": "sales_report_categories",
+            "primary_key": ["restaurant_unit_id", "start_date", "end_date", "category_id"],
+        },
     ]
 
 
@@ -452,9 +563,133 @@ def _sync_orders_for_unit(configuration: dict, unit_id, state: dict):
         op.checkpoint(state)
 
 
+def _sync_product_units(configuration: dict, unit_id, ccpid):
+    """Fetch and upsert unit conversions for one product (no pagination on this endpoint).
+
+    Args:
+        configuration: connector configuration dict.
+        unit_id: the restaurant unit ID this product belongs to.
+        ccpid: the product's companyConceptProductId.
+    """
+    body = _get(configuration, f"/products/{ccpid}/units", {"restaurantUnitId": unit_id})
+    for unit_index, unit in enumerate(_extract_list(body)):
+        op.upsert(
+            "product_units",
+            {
+                "restaurant_unit_id": unit_id,
+                "company_concept_product_id": ccpid,
+                "unit_index": unit_index,
+                "packaging_name": unit.get("packagingName"),
+                "unit": unit.get("unit"),
+                "quantity": unit.get("quantity"),
+                "price": unit.get("price"),
+                "ratio": unit.get("ratio"),
+                "ratio_display": unit.get("ratioDisplay"),
+                "parent_unit": unit.get("parentUnit"),
+                "is_count_by_unit": unit.get("isCountByUnit"),
+                "is_report_by_unit": unit.get("isReportByUnit"),
+                "is_used_on_inventory": unit.get("isUsedOnInventory"),
+            },
+        )
+
+
+def _sync_product_price_history(configuration: dict, unit_id, ccpid):
+    """Fetch and upsert price history for one product, paginated via `nextPage`.
+
+    No natural unique field exists per entry (unitName + date could collide
+    across different units on the same date), so a 0-based running index
+    across all pages is used as part of the primary key.
+
+    Args:
+        configuration: connector configuration dict.
+        unit_id: the restaurant unit ID this product belongs to.
+        ccpid: the product's companyConceptProductId.
+    """
+    for price_history_index, entry in enumerate(
+        _paginated_get(configuration, f"/products/{ccpid}/priceHistory", {"restaurantUnitId": unit_id})
+    ):
+        op.upsert(
+            "product_price_history",
+            {
+                "restaurant_unit_id": unit_id,
+                "company_concept_product_id": ccpid,
+                "price_history_index": price_history_index,
+                "unit_name": entry.get("unitName"),
+                "date": entry.get("date"),
+                "price": entry.get("price"),
+            },
+        )
+
+
+def _sync_vendor_items_by_product(configuration: dict, unit_id, ccpid):
+    """Fetch and upsert vendor items linked to one product, fanning out to conversions.
+
+    NOTE: `vendorItemId` here is a different, more granular field than the
+    `vendorItemCode` used by `_sync_vendor_items_for_vendor` elsewhere in this
+    connector - the two are not interchangeable.
+
+    Args:
+        configuration: connector configuration dict.
+        unit_id: the restaurant unit ID this product belongs to.
+        ccpid: the product's companyConceptProductId.
+    """
+    for item in _paginated_get(
+        configuration,
+        "/vendorItemsByProduct",
+        {"restaurantUnitId": unit_id, "companyConceptProductId": ccpid},
+    ):
+        vendor_item_id = item.get("vendorItemId")
+        op.upsert(
+            "vendor_items_by_product",
+            {
+                "restaurant_unit_id": unit_id,
+                "company_concept_product_id": ccpid,
+                "vendor_item_id": vendor_item_id,
+                "vendor_id": item.get("vendorId"),
+                "central_vendor_id": item.get("centralVendorId"),
+                "vendor_name": item.get("vendorName"),
+                "vendor_item_code": item.get("vendorItemCode"),
+                "central_vendor_item_id": item.get("centralVendorItemId"),
+                "vendor_item_name": item.get("vendorItemName"),
+            },
+        )
+        for conversion_index, conversion in enumerate(item.get("vendorItemConversions", []) or []):
+            op.upsert(
+                "vendor_item_conversions",
+                {
+                    "restaurant_unit_id": unit_id,
+                    "company_concept_product_id": ccpid,
+                    "vendor_item_id": vendor_item_id,
+                    "conversion_index": conversion_index,
+                    "vendor_product_unit_id": conversion.get("vendorProductUnitId"),
+                    "packaging": conversion.get("packaging"),
+                    "unit": conversion.get("unit"),
+                    "quantity": conversion.get("quantity"),
+                    "price": conversion.get("price"),
+                    "conversion_ratio": conversion.get("conversionRatio"),
+                    "last_ordered_date": conversion.get("lastOrderedDate"),
+                    "order_guide": conversion.get("orderGuide"),
+                },
+            )
+
+
 def _sync_products_for_unit(configuration: dict, unit_id):
-    """Fetch and upsert products and their nested category allocations for one unit."""
-    for product in _paginated_get(configuration, "/products", {"restaurantUnitId": unit_id}):
+    """Fetch and upsert products and their nested category allocations for one unit,
+    then fan out per product to product_units, product_price_history, and
+    vendor_items_by_product (+ its vendor_item_conversions child table).
+
+    The product list is materialized up front (rather than streamed directly
+    from `_paginated_get`) purely so the per-product fan-out count can be
+    logged before the slower fan-out loop begins.
+    """
+    products = list(_paginated_get(configuration, "/products", {"restaurantUnitId": unit_id}))
+    log.info(
+        f"Starting per-product fan-out (units, price history, vendor items) for "
+        f"{len(products)} products in restaurant unit {unit_id}; this roughly "
+        f"triples the API call count for this unit's product catalog and may be "
+        f"slow on large initial syncs"
+    )
+    for product in products:
         ccpid = product.get("companyConceptProductId")
         op.upsert(
             "products",
@@ -479,6 +714,11 @@ def _sync_products_for_unit(configuration: dict, unit_id):
                     "percent_allocation": category.get("percentAllocation"),
                 },
             )
+
+        if ccpid is not None:
+            _sync_product_units(configuration, unit_id, ccpid)
+            _sync_product_price_history(configuration, unit_id, ccpid)
+            _sync_vendor_items_by_product(configuration, unit_id, ccpid)
 
 
 def _sync_categories_for_unit(configuration: dict, unit_id):
@@ -530,6 +770,8 @@ def _sync_vendor_items_for_vendor(configuration: dict, unit_id, vendor_id):
                 "restaurant_unit_id": unit_id,
                 "vendor_id": vendor_id,
                 "vendor_item_code": vendor_item_code,
+                "vendor_item_id": item.get("vendorItemId"),
+                "vendor_item_name": item.get("vendorItemName"),
                 "central_vendor_item_id": item.get("centralVendorItemId"),
                 "vendor_name": item.get("vendorName"),
                 "central_vendor_id": item.get("centralVendorId"),
@@ -568,6 +810,482 @@ def _sync_vendors_for_unit(configuration: dict, unit_id):
             _sync_vendor_items_for_vendor(configuration, unit_id, vendor_id)
 
 
+def _sync_countsheet_sections(configuration: dict, unit_id, countsheet_id):
+    """Fetch and upsert sections for one countsheet (detail endpoint, no pagination).
+
+    The detail response repeats the countsheet's list-level fields plus adds
+    `sections[]`; only the sections are used here since the parent row was
+    already upserted from the list call.
+    """
+    detail = _get(configuration, f"/countsheets/{countsheet_id}", {"restaurantUnitId": unit_id})
+    if detail is None:
+        return
+    for section in detail.get("sections", []) or []:
+        op.upsert(
+            "countsheet_sections",
+            {
+                "restaurant_unit_id": unit_id,
+                "countsheet_id": countsheet_id,
+                "section_id": section.get("sectionId"),
+                "name": section.get("name"),
+                "position": section.get("position"),
+                "category_id": section.get("categoryId"),
+                "category_name": section.get("categoryName"),
+                "item_count": section.get("itemCount"),
+            },
+        )
+
+
+def _sync_countsheets_for_unit(configuration: dict, unit_id):
+    """Fetch and upsert countsheets and their nested sections for one restaurant unit."""
+    for countsheet in _paginated_get(configuration, "/countsheets", {"restaurantUnitId": unit_id}):
+        countsheet_id = countsheet.get("countsheetId")
+        op.upsert(
+            "countsheets",
+            {
+                "restaurant_unit_id": unit_id,
+                "countsheet_id": countsheet_id,
+                "name": countsheet.get("name"),
+                "disabled": countsheet.get("disabled"),
+                "origin": countsheet.get("origin"),
+                "last_count_date": countsheet.get("lastCountDate"),
+                "remote_id": countsheet.get("remoteId"),
+                "last_modified_date": countsheet.get("lastModifiedDate"),
+            },
+        )
+        if countsheet_id is not None:
+            _sync_countsheet_sections(configuration, unit_id, countsheet_id)
+
+
+def _sync_inventory_section_items(configuration: dict, unit_id, inventory_id, section_id):
+    """Fetch and upsert items within one inventory section, fanning out to product codes."""
+    for item in _paginated_get(
+        configuration,
+        f"/inventories/{inventory_id}/sections/{section_id}/items",
+        {"restaurantUnitId": unit_id},
+    ):
+        item_id = item.get("itemId")
+        op.upsert(
+            "inventory_section_items",
+            {
+                "restaurant_unit_id": unit_id,
+                "inventory_id": inventory_id,
+                "section_id": section_id,
+                "item_id": item_id,
+                "position": item.get("position"),
+                "product_id": item.get("productId"),
+                "product_name": item.get("productName"),
+                "company_concept_product_id": item.get("companyConceptProductId"),
+                "central_product_id": item.get("centralProductId"),
+                "quantity": item.get("quantity"),
+                "price": item.get("price"),
+                "value": item.get("value"),
+                "unit": item.get("unit"),
+                "unit_size": item.get("unitSize"),
+            },
+        )
+        for code_index, product_code in enumerate(item.get("productCodes", []) or []):
+            op.upsert(
+                "inventory_section_item_product_codes",
+                {
+                    "restaurant_unit_id": unit_id,
+                    "inventory_id": inventory_id,
+                    "section_id": section_id,
+                    "item_id": item_id,
+                    "code_index": code_index,
+                    "product_code": product_code,
+                },
+            )
+
+
+def _sync_inventory_sections(configuration: dict, unit_id, inventory_id):
+    """Fetch and upsert sections for one inventory, fanning out to section items.
+
+    A single inventory's `sections[]` is a small finite list, but the
+    `nextPage` cursor is still followed defensively via `_paginated_get`,
+    consistent with how this connector treats every other list endpoint.
+    """
+    for section in _paginated_get(
+        configuration, f"/inventories/{inventory_id}", {"restaurantUnitId": unit_id}
+    ):
+        section_id = section.get("sectionId")
+        op.upsert(
+            "inventory_sections",
+            {
+                "restaurant_unit_id": unit_id,
+                "inventory_id": inventory_id,
+                "section_id": section_id,
+                "name": section.get("name"),
+                "position": section.get("position"),
+            },
+        )
+        if section_id is not None:
+            _sync_inventory_section_items(configuration, unit_id, inventory_id, section_id)
+
+
+def _sync_inventories_for_unit(configuration: dict, unit_id):
+    """Fetch and upsert inventories for one restaurant unit, fanning out to their
+    sections and section items (which further fan out to product codes)."""
+    for inventory in _paginated_get(configuration, "/inventories", {"restaurantUnitId": unit_id}):
+        inventory_id = inventory.get("inventoryId")
+        op.upsert(
+            "inventories",
+            {
+                "restaurant_unit_id": unit_id,
+                "inventory_id": inventory_id,
+                "countsheet_id": inventory.get("countsheetId"),
+                "countsheet_name": inventory.get("countsheetName"),
+                "inventory_date": inventory.get("inventoryDate"),
+                "status": inventory.get("status"),
+                "total_value": inventory.get("totalValue"),
+                "closed_date": inventory.get("closedDate"),
+                "first_closed_date": inventory.get("firstClosedDate"),
+                "saved_date": inventory.get("savedDate"),
+                "origin": inventory.get("origin"),
+            },
+        )
+        if inventory_id is not None:
+            _sync_inventory_sections(configuration, unit_id, inventory_id)
+
+
+def _sync_recipe_types_for_unit(configuration: dict, unit_id):
+    """Fetch and upsert recipe types for one restaurant unit (no pagination on this endpoint)."""
+    body = _get(configuration, "/recipeTypes", {"restaurantUnitId": unit_id})
+    for recipe_type in _extract_list(body):
+        op.upsert(
+            "recipe_types",
+            {
+                "restaurant_unit_id": unit_id,
+                "recipe_type_id": recipe_type.get("recipeTypeId"),
+                "recipe_type_name": recipe_type.get("recipeTypeName"),
+                "recipe_category_type": recipe_type.get("recipeCategoryType"),
+                "created_date": recipe_type.get("createdDate"),
+                "concept_recipe_type_id": recipe_type.get("conceptRecipeTypeId"),
+            },
+        )
+
+
+def _sync_recipes_for_unit(configuration: dict, unit_id):
+    """Fetch and upsert all recipes for one restaurant unit (no `recipeId` filter,
+    so this fetches every recipe for the unit in one paginated sweep)."""
+    for recipe in _paginated_get(configuration, "/recipes", {"restaurantUnitId": unit_id}):
+        op.upsert(
+            "recipes",
+            {
+                "restaurant_unit_id": unit_id,
+                "recipe_id": recipe.get("recipeId"),
+                "recipe_name": recipe.get("recipeName"),
+                "recipe_cost": recipe.get("recipeCost"),
+                "last_recipe_cost_update": recipe.get("lastRecipeCostUpdate"),
+                "yield_quantity": recipe.get("yieldQuantity"),
+                "unit": recipe.get("unit"),
+                "menu_price": recipe.get("menuPrice"),
+                "recipe_type_id": recipe.get("recipeTypeId"),
+                "recipe_type_name": recipe.get("recipeTypeName"),
+                "recipe_category_type": recipe.get("recipeCategoryType"),
+                "on_inventory": recipe.get("onInventory"),
+                "is_inactive": recipe.get("isInactive"),
+                "created_date": recipe.get("createdDate"),
+                "last_modified_date": recipe.get("lastModifiedDate"),
+                "report_by_quantity": recipe.get("reportByQuantity"),
+                "report_by_ratio": recipe.get("reportByRatio"),
+                "report_by_unit": recipe.get("reportByUnit"),
+                "report_by_conversion_quantity": recipe.get("reportByConversionQuantity"),
+                "lock_inventory": recipe.get("lockInventory"),
+                "shelf_life_days": recipe.get("shelfLifeDays"),
+                "is_location_restricted": recipe.get("isLocationRestricted"),
+                "plate_cost_percentage": recipe.get("plateCostPercentage"),
+                "commissary_conversion": recipe.get("commissaryConversion"),
+                "commissary": recipe.get("commissary"),
+                "commissary_vendor_item_id": recipe.get("commissaryVendorItemId"),
+                "commissary_yield_id": recipe.get("commissaryYieldId"),
+                "commissary_use_ingredient_categories": recipe.get(
+                    "commissaryUseIngredientCategories"
+                ),
+                "has_unmatched_ingredients": recipe.get("hasUnmatchedIngredients"),
+                "uses_location_specific_menu_pricing": recipe.get(
+                    "usesLocationSpecificMenuPricing"
+                ),
+                "equipment": recipe.get("equipment"),
+                "lower_plate_cost_percentage_alert_bound": recipe.get(
+                    "lowerPlateCostPercentageAlertBound"
+                ),
+                "upper_plate_cost_percentage_alert_bound": recipe.get(
+                    "upperPlateCostPercentageAlertBound"
+                ),
+                "is_plate_cost_out_of_bounds": recipe.get("isPlateCostOutOfBounds"),
+            },
+        )
+
+
+def _sync_recipe_ingredients_for_unit(configuration: dict, unit_id):
+    """Fetch and upsert all recipe ingredients for one restaurant unit.
+
+    The `recipeId` filter is intentionally omitted so this sweeps every
+    ingredient of every recipe for the unit in a single paginated call,
+    rather than fanning out per recipe.
+    """
+    for ingredient in _paginated_get(
+        configuration, "/recipeIngredients", {"restaurantUnitId": unit_id}
+    ):
+        op.upsert(
+            "recipe_ingredients",
+            {
+                "restaurant_unit_id": unit_id,
+                "ingredient_id": ingredient.get("ingredientId"),
+                "recipe_id": ingredient.get("recipeId"),
+                "recipe_name": ingredient.get("recipeName"),
+                "ingredient_position": ingredient.get("ingredientPosition"),
+                "ingredient_name": ingredient.get("ingredientName"),
+                "ingredient_cost": ingredient.get("ingredientCost"),
+                "quantity": ingredient.get("quantity"),
+                "unit": ingredient.get("unit"),
+                "yield_percentage": ingredient.get("yieldPercentage"),
+                "company_concept_product_id": ingredient.get("companyConceptProductId"),
+                "sub_recipe_id": ingredient.get("subRecipeId"),
+                "ingredient_type": ingredient.get("ingredientType"),
+                "notes": ingredient.get("notes"),
+                "created_date": ingredient.get("createdDate"),
+                "product_report_by_unit": ingredient.get("productReportByUnit"),
+            },
+        )
+
+
+def _sync_recipe_conversions_for_unit(configuration: dict, unit_id):
+    """Fetch and upsert all recipe conversions for one restaurant unit (no `recipeId`
+    filter, so this fetches every conversion for the unit in one paginated sweep)."""
+    for conversion in _paginated_get(
+        configuration, "/recipeConversions", {"restaurantUnitId": unit_id}
+    ):
+        op.upsert(
+            "recipe_conversions",
+            {
+                "restaurant_unit_id": unit_id,
+                "recipe_conversion_id": conversion.get("recipeConversionId"),
+                "recipe_id": conversion.get("recipeId"),
+                "recipe_name": conversion.get("recipeName"),
+                "quantity": conversion.get("quantity"),
+                "unit": conversion.get("unit"),
+                "note": conversion.get("note"),
+                "created_date": conversion.get("createdDate"),
+            },
+        )
+
+
+def _sync_recipe_cost_histories_for_unit(configuration: dict, unit_id):
+    """Fetch and upsert recipe cost history entries for one restaurant unit.
+
+    No dedicated ID field exists on this resource, so the (recipe_id,
+    recorded_date) pair is used as the natural key.
+    """
+    for entry in _paginated_get(
+        configuration, "/recipeCostHistories", {"restaurantUnitId": unit_id}
+    ):
+        op.upsert(
+            "recipe_cost_histories",
+            {
+                "restaurant_unit_id": unit_id,
+                "recipe_id": entry.get("recipeId"),
+                "recorded_date": entry.get("recordedDate"),
+                "recipe_name": entry.get("recipeName"),
+                "recipe_cost": entry.get("recipeCost"),
+            },
+        )
+
+
+def _sync_profit_and_loss_section(
+    configuration: dict, unit_id, start_date, end_date, section_name, section
+):
+    """Upsert one section (income/cogs/expenses/labor) of a profit & loss report.
+
+    Handles both `items[]` nested inside each category and the section-level
+    `items[]` that are siblings of `categories[]` (not nested in any
+    category) - these are two distinct shapes per the API response.
+
+    Args:
+        configuration: connector configuration dict (unused, kept for signature
+            consistency with other `_sync_*` helpers).
+        unit_id: the restaurant unit ID this report belongs to.
+        start_date: the report's start date, part of the composite key.
+        end_date: the report's end date, part of the composite key.
+        section_name: one of "income", "cogs", "expenses", "labor".
+        section: the raw section dict from the report response.
+    """
+    if not section:
+        return
+    for category in section.get("categories", []) or []:
+        category_id = category.get("id")
+        op.upsert(
+            "profit_and_loss_report_categories",
+            {
+                "restaurant_unit_id": unit_id,
+                "start_date": start_date,
+                "end_date": end_date,
+                "section": section_name,
+                "category_id": category_id,
+                "category_name": category.get("name"),
+                "total": category.get("total"),
+                "percent_of_sales": category.get("percentOfSales"),
+            },
+        )
+        for item_index, item in enumerate(category.get("items", []) or []):
+            op.upsert(
+                "profit_and_loss_report_category_items",
+                {
+                    "restaurant_unit_id": unit_id,
+                    "start_date": start_date,
+                    "end_date": end_date,
+                    "section": section_name,
+                    "category_id": category_id,
+                    "item_index": item_index,
+                    "name": item.get("name"),
+                    "total": item.get("total"),
+                    "percent_of_sales": item.get("percentOfSales"),
+                },
+            )
+
+    for item_index, item in enumerate(section.get("items", []) or []):
+        op.upsert(
+            "profit_and_loss_report_section_items",
+            {
+                "restaurant_unit_id": unit_id,
+                "start_date": start_date,
+                "end_date": end_date,
+                "section": section_name,
+                "item_index": item_index,
+                "name": item.get("name"),
+                "total": item.get("total"),
+                "percent_of_sales": item.get("percentOfSales"),
+            },
+        )
+
+
+def _sync_profit_and_loss_for_unit(configuration: dict, unit_id):
+    """Fetch and upsert the profit & loss report for one restaurant unit.
+
+    This is a single-shot call (no pagination) covering the full configured
+    date range - `configuration.get("initial_sync_start", "2023-01-01")`
+    through today, the same default already used for orders - rather than
+    windowed per-run like orders. The response body is a list even though
+    scoped to a single restaurantUnitId (should be 0 or 1 entries for a
+    single-unit request), so it is iterated defensively rather than assuming
+    exactly one entry.
+    """
+    start = configuration.get("initial_sync_start", "2023-01-01")
+    end = datetime.now(timezone.utc).date().isoformat()
+    body = _get(
+        configuration,
+        "/profitAndLoss/report",
+        {"restaurantUnitId": unit_id, "startDate": start, "endDate": end},
+    )
+    for report in _extract_list(body):
+        report_start = report.get("startDate")
+        report_end = report.get("endDate")
+        summary = report.get("summary", {}) or {}
+        income = report.get("income", {}) or {}
+        cogs = report.get("cogs", {}) or {}
+        expenses = report.get("expenses", {}) or {}
+        labor = report.get("labor", {}) or {}
+
+        op.upsert(
+            "profit_and_loss_reports",
+            {
+                "restaurant_unit_id": unit_id,
+                "start_date": report_start,
+                "end_date": report_end,
+                "restaurant_unit_name": report.get("restaurantUnitName"),
+                "company_id": report.get("companyId"),
+                "company_name": report.get("companyName"),
+                "concept_id": report.get("conceptId"),
+                "concept_name": report.get("conceptName"),
+                "currency": report.get("currency"),
+                "summary_gross_profit": summary.get("grossProfit"),
+                "summary_gross_profit_percent_of_sales": summary.get(
+                    "grossProfitPercentOfSales"
+                ),
+                "summary_prime_cost_total": summary.get("primeCostTotal"),
+                "summary_prime_cost_percent_of_sales": summary.get(
+                    "primeCostPercentOfSales"
+                ),
+                "summary_controllable_profit": summary.get("controllableProfit"),
+                "summary_controllable_profit_percent_of_sales": summary.get(
+                    "controllableProfitPercentOfSales"
+                ),
+                "income_total": income.get("total"),
+                "income_total_percent_of_sales": income.get("totalPercentOfSales"),
+                "cogs_total": cogs.get("total"),
+                "cogs_total_percent_of_sales": cogs.get("totalPercentOfSales"),
+                "expenses_total": expenses.get("total"),
+                "expenses_total_percent_of_sales": expenses.get("totalPercentOfSales"),
+                "labor_total": labor.get("total"),
+                "labor_total_percent_of_sales": labor.get("totalPercentOfSales"),
+            },
+        )
+
+        _sync_profit_and_loss_section(
+            configuration, unit_id, report_start, report_end, "income", income
+        )
+        _sync_profit_and_loss_section(
+            configuration, unit_id, report_start, report_end, "cogs", cogs
+        )
+        _sync_profit_and_loss_section(
+            configuration, unit_id, report_start, report_end, "expenses", expenses
+        )
+        _sync_profit_and_loss_section(
+            configuration, unit_id, report_start, report_end, "labor", labor
+        )
+
+
+def _sync_sales_report_for_unit(configuration: dict, unit_id):
+    """Fetch and upsert the sales report for one restaurant unit, fanning out to categories.
+
+    Single-shot call (no pagination) covering the same full configured date
+    range as `_sync_profit_and_loss_for_unit`. The response body is a list
+    even though scoped to a single restaurantUnitId, so it is iterated
+    defensively rather than assuming exactly one entry.
+    """
+    start = configuration.get("initial_sync_start", "2023-01-01")
+    end = datetime.now(timezone.utc).date().isoformat()
+    body = _get(
+        configuration,
+        "/sales/report",
+        {"restaurantUnitId": unit_id, "startDate": start, "endDate": end},
+    )
+    for report in _extract_list(body):
+        report_start = report.get("startDate")
+        report_end = report.get("endDate")
+        summary = report.get("summary", {}) or {}
+
+        op.upsert(
+            "sales_reports",
+            {
+                "restaurant_unit_id": unit_id,
+                "start_date": report_start,
+                "end_date": report_end,
+                "restaurant_unit_name": report.get("restaurantUnitName"),
+                "company_id": report.get("companyId"),
+                "company_name": report.get("companyName"),
+                "concept_id": report.get("conceptId"),
+                "concept_name": report.get("conceptName"),
+                "currency": report.get("currency"),
+                "summary_total_sales": summary.get("totalSales"),
+            },
+        )
+        for category in report.get("categories", []) or []:
+            op.upsert(
+                "sales_report_categories",
+                {
+                    "restaurant_unit_id": unit_id,
+                    "start_date": report_start,
+                    "end_date": report_end,
+                    "category_id": category.get("id"),
+                    "category_name": category.get("name"),
+                    "total": category.get("total"),
+                    "percent_of_total_sales": category.get("percentOfTotalSales"),
+                },
+            )
+
+
 def update(configuration: dict, state: dict):
     """Sync all MarginEdge data into the destination.
 
@@ -577,9 +1295,13 @@ def update(configuration: dict, state: dict):
       2. Sync the two account-level, unit-independent tables (groups, group
          categories).
       3. For each restaurant unit: incrementally sync orders (with detail,
-         line items, attachments), then full-refresh products, categories,
-         and vendors (which fan out further into vendor_items and
-         vendor_item_packaging).
+         line items, attachments), then full-refresh products (which fan out
+         further into product_units, product_price_history, and
+         vendor_items_by_product), categories, vendors (which fan out further
+         into vendor_items and vendor_item_packaging), countsheets (+
+         sections), inventories (+ sections, items, product codes), recipe
+         types, recipes, recipe ingredients, recipe conversions, recipe cost
+         histories, the profit & loss report, and the sales report.
 
     A 403 response from any call is treated as non-retryable and propagates
     up to abort the sync entirely (invalid key or unit not authorized),
@@ -616,6 +1338,15 @@ def update(configuration: dict, state: dict):
         _sync_products_for_unit(configuration, unit_id)
         _sync_categories_for_unit(configuration, unit_id)
         _sync_vendors_for_unit(configuration, unit_id)
+        _sync_countsheets_for_unit(configuration, unit_id)
+        _sync_inventories_for_unit(configuration, unit_id)
+        _sync_recipe_types_for_unit(configuration, unit_id)
+        _sync_recipes_for_unit(configuration, unit_id)
+        _sync_recipe_ingredients_for_unit(configuration, unit_id)
+        _sync_recipe_conversions_for_unit(configuration, unit_id)
+        _sync_recipe_cost_histories_for_unit(configuration, unit_id)
+        _sync_profit_and_loss_for_unit(configuration, unit_id)
+        _sync_sales_report_for_unit(configuration, unit_id)
 
         op.checkpoint(state)
 
