@@ -229,6 +229,20 @@ def _extract_list(body) -> list:
     return []
 
 
+def _fallback_id(value, index):
+    """Return `value` if not None, else a stable synthetic ID derived from position.
+
+    Confirmed in live client data: some MarginEdge nested list items (e.g. a
+    product's category allocations, which can include an "unallocated"
+    remainder with no category) have a null natural ID field, even though
+    the API's documented examples always show one populated. A null primary
+    key value is rejected outright by the destination, so every PK field
+    sourced from a nested list item's own ID field runs through this rather
+    than assuming the field is always present.
+    """
+    return value if value is not None else f"__unassigned_{index}"
+
+
 def _paginated_get(configuration: dict, path: str, params: dict = None):
     """Yield every record from a MarginEdge list endpoint, following the `nextPage` cursor.
 
@@ -544,13 +558,13 @@ def _sync_one_order(configuration: dict, unit_id, order: dict):
             },
         )
 
-    for attachment in detail.get("attachments", []) or []:
+    for attachment_index, attachment in enumerate(detail.get("attachments", []) or []):
         op.upsert(
             "order_attachments",
             {
                 "restaurant_unit_id": unit_id,
                 "order_id": order_id,
-                "attachment_id": attachment.get("attachmentId"),
+                "attachment_id": _fallback_id(attachment.get("attachmentId"), attachment_index),
                 # NOTE: attachment_url may be a temporary/expiring signed URL - do not
                 # assume long-term validity of this value.
                 "attachment_url": attachment.get("attachmentUrl"),
@@ -672,12 +686,12 @@ def _sync_vendor_items_by_product(configuration: dict, unit_id, ccpid):
         unit_id: the restaurant unit ID this product belongs to.
         ccpid: the product's companyConceptProductId.
     """
-    for item in _paginated_get(
+    for item_index, item in enumerate(_paginated_get(
         configuration,
         "/vendorItemsByProduct",
         {"restaurantUnitId": unit_id, "companyConceptProductId": ccpid},
-    ):
-        vendor_item_id = item.get("vendorItemId")
+    )):
+        vendor_item_id = _fallback_id(item.get("vendorItemId"), item_index)
         op.upsert(
             "vendor_items_by_product",
             {
@@ -743,13 +757,13 @@ def _sync_products_for_unit(configuration: dict, unit_id):
                 "item_count": product.get("itemCount"),
             },
         )
-        for category in product.get("categories", []) or []:
+        for category_index, category in enumerate(product.get("categories", []) or []):
             op.upsert(
                 "product_categories",
                 {
                     "restaurant_unit_id": unit_id,
                     "company_concept_product_id": ccpid,
-                    "category_id": category.get("categoryId"),
+                    "category_id": _fallback_id(category.get("categoryId"), category_index),
                     "percent_allocation": category.get("percentAllocation"),
                 },
             )
@@ -782,14 +796,14 @@ def _sync_vendor_item_packaging(configuration: dict, unit_id, vendor_id, vendor_
         f"/vendors/{vendor_id}/vendorItems/{vendor_item_code}/packaging",
         {"restaurantUnitId": unit_id},
     )
-    for package in _extract_list(body):
+    for package_index, package in enumerate(_extract_list(body)):
         op.upsert(
             "vendor_item_packaging",
             {
                 "restaurant_unit_id": unit_id,
                 "vendor_id": vendor_id,
                 "vendor_item_code": vendor_item_code,
-                "packaging_id": package.get("packagingId"),
+                "packaging_id": _fallback_id(package.get("packagingId"), package_index),
                 "packaging_name": package.get("packagingName"),
                 "unit": package.get("unit"),
                 "quantity": package.get("quantity"),
@@ -799,10 +813,11 @@ def _sync_vendor_item_packaging(configuration: dict, unit_id, vendor_id, vendor_
 
 def _sync_vendor_items_for_vendor(configuration: dict, unit_id, vendor_id):
     """Fetch and upsert vendor_items for one vendor, fanning out to packaging per item."""
-    for item in _paginated_get(
+    for item_index, item in enumerate(_paginated_get(
         configuration, f"/vendors/{vendor_id}/vendorItems", {"restaurantUnitId": unit_id}
-    ):
-        vendor_item_code = item.get("vendorItemCode")
+    )):
+        raw_vendor_item_code = item.get("vendorItemCode")
+        vendor_item_code = _fallback_id(raw_vendor_item_code, item_index)
         op.upsert(
             "vendor_items",
             {
@@ -818,7 +833,7 @@ def _sync_vendor_items_for_vendor(configuration: dict, unit_id, vendor_id):
                 "product_name": item.get("productName"),
             },
         )
-        if vendor_item_code is not None:
+        if raw_vendor_item_code is not None:
             _sync_vendor_item_packaging(configuration, unit_id, vendor_id, vendor_item_code)
 
 
@@ -859,13 +874,13 @@ def _sync_countsheet_sections(configuration: dict, unit_id, countsheet_id):
     detail = _get(configuration, f"/countsheets/{countsheet_id}", {"restaurantUnitId": unit_id})
     if detail is None:
         return
-    for section in detail.get("sections", []) or []:
+    for section_index, section in enumerate(detail.get("sections", []) or []):
         op.upsert(
             "countsheet_sections",
             {
                 "restaurant_unit_id": unit_id,
                 "countsheet_id": countsheet_id,
-                "section_id": section.get("sectionId"),
+                "section_id": _fallback_id(section.get("sectionId"), section_index),
                 "name": section.get("name"),
                 "position": section.get("position"),
                 "category_id": section.get("categoryId"),
@@ -898,12 +913,12 @@ def _sync_countsheets_for_unit(configuration: dict, unit_id):
 
 def _sync_inventory_section_items(configuration: dict, unit_id, inventory_id, section_id):
     """Fetch and upsert items within one inventory section, fanning out to product codes."""
-    for item in _paginated_get(
+    for item_index, item in enumerate(_paginated_get(
         configuration,
         f"/inventories/{inventory_id}/sections/{section_id}/items",
         {"restaurantUnitId": unit_id},
-    ):
-        item_id = item.get("itemId")
+    )):
+        item_id = _fallback_id(item.get("itemId"), item_index)
         op.upsert(
             "inventory_section_items",
             {
@@ -944,10 +959,11 @@ def _sync_inventory_sections(configuration: dict, unit_id, inventory_id):
     `nextPage` cursor is still followed defensively via `_paginated_get`,
     consistent with how this connector treats every other list endpoint.
     """
-    for section in _paginated_get(
+    for section_index, section in enumerate(_paginated_get(
         configuration, f"/inventories/{inventory_id}", {"restaurantUnitId": unit_id}
-    ):
-        section_id = section.get("sectionId")
+    )):
+        raw_section_id = section.get("sectionId")
+        section_id = _fallback_id(raw_section_id, section_index)
         op.upsert(
             "inventory_sections",
             {
@@ -958,7 +974,7 @@ def _sync_inventory_sections(configuration: dict, unit_id, inventory_id):
                 "position": section.get("position"),
             },
         )
-        if section_id is not None:
+        if raw_section_id is not None:
             _sync_inventory_section_items(configuration, unit_id, inventory_id, section_id)
 
 
@@ -1152,8 +1168,8 @@ def _sync_profit_and_loss_section(
     """
     if not section:
         return
-    for category in section.get("categories", []) or []:
-        category_id = category.get("id")
+    for category_index, category in enumerate(section.get("categories", []) or []):
+        category_id = _fallback_id(category.get("id"), category_index)
         op.upsert(
             "profit_and_loss_report_categories",
             {
@@ -1310,14 +1326,14 @@ def _sync_sales_report_for_unit(configuration: dict, unit_id):
                 "summary_total_sales": summary.get("totalSales"),
             },
         )
-        for category in report.get("categories", []) or []:
+        for category_index, category in enumerate(report.get("categories", []) or []):
             op.upsert(
                 "sales_report_categories",
                 {
                     "restaurant_unit_id": unit_id,
                     "start_date": report_start,
                     "end_date": report_end,
-                    "category_id": category.get("id"),
+                    "category_id": _fallback_id(category.get("id"), category_index),
                     "category_name": category.get("name"),
                     "total": category.get("total"),
                     "percent_of_total_sales": category.get("percentOfTotalSales"),

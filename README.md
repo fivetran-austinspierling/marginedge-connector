@@ -112,6 +112,10 @@ The connector performs the following actions for each key aspect:
 
 Uses Fivetran SDK logging levels (`log.info`, `log.debug`, `log.warning`, `log.error`) for detailed sync visibility.
 
+### Null primary keys in nested list items
+
+Confirmed in live client data: some nested list items have a null natural ID field even though MarginEdge's documented examples always show one populated (e.g. a product's category allocation can include an "unallocated" remainder with no `categoryId`). Since the destination rejects a null primary key outright, every table whose primary key is sourced from a nested list item's own ID field (`product_categories`, `profit_and_loss_report_categories`, `sales_report_categories`, `order_attachments`, `vendor_item_packaging`, `vendor_items`, `vendor_items_by_product`, `countsheet_sections`, `inventory_sections`, `inventory_section_items`) runs that field through `_fallback_id()`, which substitutes a stable `__unassigned_<index>` value (based on position in the source array) whenever the real ID is missing, so the row is still captured instead of crashing the sync.
+
 ## Tables created
 
 ### Root / discovery
