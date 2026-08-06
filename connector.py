@@ -229,18 +229,34 @@ def _extract_list(body) -> list:
     return []
 
 
+def _is_blank(value) -> bool:
+    """True for None or an empty/whitespace-only string.
+
+    Confirmed in live client data: MarginEdge can send an empty string
+    (not just JSON null) where an ID field is missing. Treating only `None`
+    as missing let a blank `vendorItemCode` pass an `is not None` fan-out
+    guard unnoticed and get spliced directly into a URL path, producing a
+    malformed double-slash path (".../vendorItems//packaging") and an
+    unhandled 400. Every check for "is this ID actually present" - whether
+    feeding a primary key or building a request URL - must treat blank the
+    same as null.
+    """
+    return value is None or (isinstance(value, str) and value.strip() == "")
+
+
 def _fallback_id(value, index):
-    """Return `value` if not None, else a stable synthetic ID derived from position.
+    """Return `value` if present, else a stable synthetic ID derived from position.
 
     Confirmed in live client data: some MarginEdge nested list items (e.g. a
     product's category allocations, which can include an "unallocated"
-    remainder with no category) have a null natural ID field, even though
-    the API's documented examples always show one populated. A null primary
-    key value is rejected outright by the destination, so every PK field
-    sourced from a nested list item's own ID field runs through this rather
-    than assuming the field is always present.
+    remainder with no category) have a missing natural ID field (null or
+    blank string), even though the API's documented examples always show
+    one populated. A null primary key value is rejected outright by the
+    destination, so every PK field sourced from a nested list item's own ID
+    field runs through this rather than assuming the field is always
+    present.
     """
-    return value if value is not None else f"__unassigned_{index}"
+    return value if not _is_blank(value) else f"__unassigned_{index}"
 
 
 def _paginated_get(configuration: dict, path: str, params: dict = None):
@@ -503,7 +519,7 @@ def _sync_one_order(configuration: dict, unit_id, order: dict):
         order: the raw order dict from the /orders list endpoint.
     """
     order_id = order.get("orderId")
-    if order_id is None:
+    if _is_blank(order_id):
         log.warning(f"Skipping order with missing orderId for unit {unit_id}: {order}")
         return
 
@@ -742,8 +758,9 @@ def _sync_products_for_unit(configuration: dict, unit_id):
         f"triples the API call count for this unit's product catalog and may be "
         f"slow on large initial syncs"
     )
-    for product in products:
-        ccpid = product.get("companyConceptProductId")
+    for product_index, product in enumerate(products):
+        raw_ccpid = product.get("companyConceptProductId")
+        ccpid = _fallback_id(raw_ccpid, product_index)
         op.upsert(
             "products",
             {
@@ -768,7 +785,7 @@ def _sync_products_for_unit(configuration: dict, unit_id):
                 },
             )
 
-        if ccpid is not None:
+        if not _is_blank(raw_ccpid):
             _sync_product_units(configuration, unit_id, ccpid)
             _sync_product_price_history(configuration, unit_id, ccpid)
             _sync_vendor_items_by_product(configuration, unit_id, ccpid)
@@ -833,14 +850,17 @@ def _sync_vendor_items_for_vendor(configuration: dict, unit_id, vendor_id):
                 "product_name": item.get("productName"),
             },
         )
-        if raw_vendor_item_code is not None:
+        if not _is_blank(raw_vendor_item_code):
             _sync_vendor_item_packaging(configuration, unit_id, vendor_id, vendor_item_code)
 
 
 def _sync_vendors_for_unit(configuration: dict, unit_id):
     """Fetch and upsert vendors and their nested accounts for one unit, fanning out to vendor items."""
-    for vendor in _paginated_get(configuration, "/vendors", {"restaurantUnitId": unit_id}):
-        vendor_id = vendor.get("vendorId")
+    for vendor_index, vendor in enumerate(
+        _paginated_get(configuration, "/vendors", {"restaurantUnitId": unit_id})
+    ):
+        raw_vendor_id = vendor.get("vendorId")
+        vendor_id = _fallback_id(raw_vendor_id, vendor_index)
         op.upsert(
             "vendors",
             {
@@ -860,7 +880,7 @@ def _sync_vendors_for_unit(configuration: dict, unit_id):
                     "vendor_account_number": account.get("vendorAccountNumber"),
                 },
             )
-        if vendor_id is not None:
+        if not _is_blank(raw_vendor_id):
             _sync_vendor_items_for_vendor(configuration, unit_id, vendor_id)
 
 
@@ -892,8 +912,11 @@ def _sync_countsheet_sections(configuration: dict, unit_id, countsheet_id):
 
 def _sync_countsheets_for_unit(configuration: dict, unit_id):
     """Fetch and upsert countsheets and their nested sections for one restaurant unit."""
-    for countsheet in _paginated_get(configuration, "/countsheets", {"restaurantUnitId": unit_id}):
-        countsheet_id = countsheet.get("countsheetId")
+    for countsheet_index, countsheet in enumerate(
+        _paginated_get(configuration, "/countsheets", {"restaurantUnitId": unit_id})
+    ):
+        raw_countsheet_id = countsheet.get("countsheetId")
+        countsheet_id = _fallback_id(raw_countsheet_id, countsheet_index)
         op.upsert(
             "countsheets",
             {
@@ -907,7 +930,7 @@ def _sync_countsheets_for_unit(configuration: dict, unit_id):
                 "last_modified_date": countsheet.get("lastModifiedDate"),
             },
         )
-        if countsheet_id is not None:
+        if not _is_blank(raw_countsheet_id):
             _sync_countsheet_sections(configuration, unit_id, countsheet_id)
 
 
@@ -974,15 +997,18 @@ def _sync_inventory_sections(configuration: dict, unit_id, inventory_id):
                 "position": section.get("position"),
             },
         )
-        if raw_section_id is not None:
+        if not _is_blank(raw_section_id):
             _sync_inventory_section_items(configuration, unit_id, inventory_id, section_id)
 
 
 def _sync_inventories_for_unit(configuration: dict, unit_id):
     """Fetch and upsert inventories for one restaurant unit, fanning out to their
     sections and section items (which further fan out to product codes)."""
-    for inventory in _paginated_get(configuration, "/inventories", {"restaurantUnitId": unit_id}):
-        inventory_id = inventory.get("inventoryId")
+    for inventory_index, inventory in enumerate(
+        _paginated_get(configuration, "/inventories", {"restaurantUnitId": unit_id})
+    ):
+        raw_inventory_id = inventory.get("inventoryId")
+        inventory_id = _fallback_id(raw_inventory_id, inventory_index)
         op.upsert(
             "inventories",
             {
@@ -999,7 +1025,7 @@ def _sync_inventories_for_unit(configuration: dict, unit_id):
                 "origin": inventory.get("origin"),
             },
         )
-        if inventory_id is not None:
+        if not _is_blank(raw_inventory_id):
             _sync_inventory_sections(configuration, unit_id, inventory_id)
 
 
@@ -1380,7 +1406,7 @@ def update(configuration: dict, state: dict):
 
     for unit in units:
         unit_id = unit.get("id")
-        if unit_id is None:
+        if _is_blank(unit_id):
             log.warning(f"Skipping restaurant unit with no id: {unit}")
             continue
 
