@@ -48,6 +48,7 @@ See README.md for setup instructions.
 
 import time
 from datetime import date, datetime, timedelta, timezone
+from urllib.parse import quote
 
 import requests as rq
 
@@ -257,6 +258,20 @@ def _fallback_id(value, index):
     present.
     """
     return value if not _is_blank(value) else f"__unassigned_{index}"
+
+
+def _url_path_segment(value) -> str:
+    """Percent-encode a value for safe use as a single URL path segment.
+
+    Confirmed in live client data: some MarginEdge IDs are human-readable
+    codes rather than opaque tokens (e.g. a `vendorItemCode` like
+    "..._W/_CARAMEL_BC_..."), and can contain characters like `/` that are
+    reserved in a URL path. Splicing one in unencoded turns it into extra
+    path segments, so the API gateway routes the request incorrectly and
+    returns an unrelated error (a 403 was observed, not a 404) instead of
+    the intended resource. `safe=""` ensures even `/` itself gets encoded.
+    """
+    return quote(str(value), safe="")
 
 
 def _paginated_get(configuration: dict, path: str, params: dict = None):
@@ -537,7 +552,7 @@ def _sync_one_order(configuration: dict, unit_id, order: dict):
         "status": order.get("status"),
     }
 
-    detail = _get(configuration, f"/orders/{order_id}", {"restaurantUnitId": unit_id})
+    detail = _get(configuration, f"/orders/{_url_path_segment(order_id)}", {"restaurantUnitId": unit_id})
     if detail is None:
         log.warning(f"Order detail not found (404) for orderId={order_id}, unit={unit_id}; upserting list fields only")
         op.upsert("orders", record)
@@ -640,7 +655,7 @@ def _sync_product_units(configuration: dict, unit_id, ccpid):
         unit_id: the restaurant unit ID this product belongs to.
         ccpid: the product's companyConceptProductId.
     """
-    body = _get(configuration, f"/products/{ccpid}/units", {"restaurantUnitId": unit_id})
+    body = _get(configuration, f"/products/{_url_path_segment(ccpid)}/units", {"restaurantUnitId": unit_id})
     for unit_index, unit in enumerate(_extract_list(body)):
         op.upsert(
             "product_units",
@@ -675,7 +690,7 @@ def _sync_product_price_history(configuration: dict, unit_id, ccpid):
         ccpid: the product's companyConceptProductId.
     """
     for price_history_index, entry in enumerate(
-        _paginated_get(configuration, f"/products/{ccpid}/priceHistory", {"restaurantUnitId": unit_id})
+        _paginated_get(configuration, f"/products/{_url_path_segment(ccpid)}/priceHistory", {"restaurantUnitId": unit_id})
     ):
         op.upsert(
             "product_price_history",
@@ -810,7 +825,7 @@ def _sync_vendor_item_packaging(configuration: dict, unit_id, vendor_id, vendor_
     """Fetch and upsert packaging options for one vendor item (no pagination on this endpoint)."""
     body = _get(
         configuration,
-        f"/vendors/{vendor_id}/vendorItems/{vendor_item_code}/packaging",
+        f"/vendors/{_url_path_segment(vendor_id)}/vendorItems/{_url_path_segment(vendor_item_code)}/packaging",
         {"restaurantUnitId": unit_id},
     )
     for package_index, package in enumerate(_extract_list(body)):
@@ -831,7 +846,7 @@ def _sync_vendor_item_packaging(configuration: dict, unit_id, vendor_id, vendor_
 def _sync_vendor_items_for_vendor(configuration: dict, unit_id, vendor_id):
     """Fetch and upsert vendor_items for one vendor, fanning out to packaging per item."""
     for item_index, item in enumerate(_paginated_get(
-        configuration, f"/vendors/{vendor_id}/vendorItems", {"restaurantUnitId": unit_id}
+        configuration, f"/vendors/{_url_path_segment(vendor_id)}/vendorItems", {"restaurantUnitId": unit_id}
     )):
         raw_vendor_item_code = item.get("vendorItemCode")
         vendor_item_code = _fallback_id(raw_vendor_item_code, item_index)
@@ -891,7 +906,7 @@ def _sync_countsheet_sections(configuration: dict, unit_id, countsheet_id):
     `sections[]`; only the sections are used here since the parent row was
     already upserted from the list call.
     """
-    detail = _get(configuration, f"/countsheets/{countsheet_id}", {"restaurantUnitId": unit_id})
+    detail = _get(configuration, f"/countsheets/{_url_path_segment(countsheet_id)}", {"restaurantUnitId": unit_id})
     if detail is None:
         return
     for section_index, section in enumerate(detail.get("sections", []) or []):
@@ -938,7 +953,7 @@ def _sync_inventory_section_items(configuration: dict, unit_id, inventory_id, se
     """Fetch and upsert items within one inventory section, fanning out to product codes."""
     for item_index, item in enumerate(_paginated_get(
         configuration,
-        f"/inventories/{inventory_id}/sections/{section_id}/items",
+        f"/inventories/{_url_path_segment(inventory_id)}/sections/{_url_path_segment(section_id)}/items",
         {"restaurantUnitId": unit_id},
     )):
         item_id = _fallback_id(item.get("itemId"), item_index)
@@ -983,7 +998,7 @@ def _sync_inventory_sections(configuration: dict, unit_id, inventory_id):
     consistent with how this connector treats every other list endpoint.
     """
     for section_index, section in enumerate(_paginated_get(
-        configuration, f"/inventories/{inventory_id}", {"restaurantUnitId": unit_id}
+        configuration, f"/inventories/{_url_path_segment(inventory_id)}", {"restaurantUnitId": unit_id}
     )):
         raw_section_id = section.get("sectionId")
         section_id = _fallback_id(raw_section_id, section_index)
