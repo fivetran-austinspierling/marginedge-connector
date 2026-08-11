@@ -822,7 +822,24 @@ def _sync_categories_for_unit(configuration: dict, unit_id):
 
 
 def _sync_vendor_item_packaging(configuration: dict, unit_id, vendor_id, vendor_item_code):
-    """Fetch and upsert packaging options for one vendor item (no pagination on this endpoint)."""
+    """Fetch and upsert packaging options for one vendor item (no pagination on this endpoint).
+
+    Confirmed in live client data: a real `vendorItemCode` can contain a
+    literal `/` (it's a free-form code, not an opaque token). Percent-encoding
+    it to `%2F` doesn't help - MarginEdge's API gateway rejects an encoded
+    slash in this path segment with a 400 regardless (a well-known AWS API
+    Gateway limitation: it decodes the path before route-matching, so `%2F`
+    still looks like an extra segment). There is no way to reach this
+    endpoint for such a code, so it's skipped with a warning rather than
+    aborting the whole sync over one uncooperative vendor item.
+    """
+    if "/" in str(vendor_item_code):
+        log.warning(
+            f"Skipping packaging lookup for vendor_item_code={vendor_item_code!r} "
+            f"(vendor {vendor_id}, unit {unit_id}): contains '/', which MarginEdge's "
+            f"API rejects in this path segment even when percent-encoded"
+        )
+        return
     body = _get(
         configuration,
         f"/vendors/{_url_path_segment(vendor_id)}/vendorItems/{_url_path_segment(vendor_item_code)}/packaging",
