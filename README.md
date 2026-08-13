@@ -38,7 +38,7 @@ Please verify the following while running `fivetran debug` and report back what 
 - [ ] `orders` rows look correct for a known date range — in particular, confirm whether MarginEdge's `startDate`/`endDate` filter (and thus this connector's incremental cursor) should be based on `createdDate` or `invoiceDate`. Compare a few orders' dates against what you see in the MarginEdge UI for that same window
 - [ ] Row counts across `restaurant_units`, `products`, `vendors`, `categories` roughly match what you'd expect from the account being tested (confirms the `restaurantUnitId` fan-out is discovering everything it should)
 - [ ] Note how long the initial sync takes — the per-product fan-out (`product_units`, `product_price_history`, `vendor_items_by_product`) roughly triples the API call count for large product catalogs, so first-run duration is worth watching on accounts with many products
-- [ ] Re-run `fivetran debug` a second time and confirm the `orders` incremental logic doesn't re-sync the entire history (checkpointed state should pick up from where it left off)
+- [ ] Re-run `fivetran debug` a second time (without `fivetran reset` in between - reset wipes the checkpointed state and forces a full re-sync by design) and confirm the `orders` incremental logic doesn't re-sync the entire history
 
 ## Features
 

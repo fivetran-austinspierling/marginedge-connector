@@ -38,26 +38,28 @@ pip install fivetran-connector-sdk
 
 No other dependencies are needed — `requirements.txt` is intentionally empty (the connector only uses `requests`, which the SDK provides).
 
-## 4. Add your API key to the configuration
+## 4. Add your API key to the configuration (first time only)
 
-Do **not** open `configuration.json` and type the key in directly. Run:
+Do **not** open `configuration.json` and type the key in directly. Run this once, the very first time:
 
 ```powershell
 fivetran reset
 fivetran debug --configuration configuration.json
 ```
 
-The first run will prompt you interactively for any configuration values it doesn't yet have real values for (`api_key`, `initial_sync_start`). Enter your real API key when prompted — it's encrypted at rest, not stored in plain text in `configuration.json`.
+This run will prompt you interactively for any configuration values it doesn't yet have real values for (`api_key`, `initial_sync_start`). Enter your real API key when prompted — it's encrypted at rest, not stored in plain text in `configuration.json`.
 
 > If your SDK version instead expects a separate encryption helper script, run that from this directory per the instructions in `README.md` under **Configuration file** before running `fivetran debug`.
 
-## 5. Run the connector
+> ⚠️ **Do not re-run `fivetran reset` before every retest.** `fivetran debug` persists sync state (`state.json`/`warehouse.db`) between runs so the `orders` table's incremental logic can resume from where it left off — that's the whole point of testing it locally. `fivetran reset` wipes that state and forces every table back to a full initial sync, including `orders`. Only run `reset` again if you deliberately want to start over from a clean slate (e.g. to re-test the very first sync from scratch).
+
+## 5. Run the connector (every time after that)
 
 ```powershell
 fivetran debug
 ```
 
-This runs a full sync against the live MarginEdge API (there's no sandbox environment — this is real production data, but the connector only performs GET requests, so nothing on the MarginEdge side is modified) and writes the results to a local DuckDB file you can inspect.
+No `fivetran reset` before this — just the bare command above. This runs a sync against the live MarginEdge API (there's no sandbox environment — this is real production data, but the connector only performs GET requests, so nothing on the MarginEdge side is modified), resuming from whatever was checkpointed last time, and writes the results to a local DuckDB file you can inspect.
 
 ## 6. Check the results
 
