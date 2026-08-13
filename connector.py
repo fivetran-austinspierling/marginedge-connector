@@ -64,6 +64,7 @@ __MAX_DELAY = 60  # seconds, cap for exponential backoff
 __REQUEST_DELAY = 0.15  # seconds, starting fixed delay between every request
 __MAX_REQUEST_DELAY = 5.0  # seconds, cap for the adaptive steady-state delay below
 __ORDER_WINDOW_DAYS = 30  # size of each incremental orders date window
+__DEFAULT_FULL_REFRESH_INTERVAL_DAYS = 7  # default cadence for the full-refresh tables below
 
 # Mutable, module-level (not persisted in sync state - resets every sync run):
 # tracks the current steady-state delay applied before every request. Plain
@@ -319,6 +320,31 @@ def _date_windows(start: date, end: date, window_days: int):
         window_end = min(current + timedelta(days=window_days), end)
         yield current, window_end
         current = window_end
+
+
+def _full_refresh_due(configuration: dict, state: dict) -> bool:
+    """Return True if the full-refresh tables (everything except `orders`) should
+    run this sync.
+
+    34 of this connector's 35 tables have no date filter available from the
+    API, so they're fully re-fetched every sync by design - fine for a
+    handful of small reference tables, but the deep per-product/per-vendor
+    fan-out (`product_units`, `vendor_item_packaging`, etc.) makes this
+    expensive and repeatedly triggers rate limiting on a large catalog when
+    it runs on every scheduled sync. Similar to how many Fivetran
+    Application Connectors treat slow-changing reference data, this gates
+    that whole block behind a configurable interval (default weekly) tracked
+    via `state["last_full_refresh"]`, while `orders` still syncs
+    incrementally every run regardless.
+    """
+    interval_days = int(
+        configuration.get("full_refresh_interval_days", __DEFAULT_FULL_REFRESH_INTERVAL_DAYS)
+    )
+    last_run = state.get("last_full_refresh")
+    if not last_run:
+        return True
+    days_since = (datetime.now(timezone.utc).date() - _parse_date(last_run)).days
+    return days_since >= interval_days
 
 
 def schema(configuration: dict):
@@ -1406,15 +1432,20 @@ def update(configuration: dict, state: dict):
       1. Fetch restaurant_units once (root of every fan-out below) and reuse
          it for every restaurant-scoped table instead of re-fetching.
       2. Sync the two account-level, unit-independent tables (groups, group
-         categories).
-      3. For each restaurant unit: incrementally sync orders (with detail,
-         line items, attachments), then full-refresh products (which fan out
-         further into product_units, product_price_history, and
-         vendor_items_by_product), categories, vendors (which fan out further
-         into vendor_items and vendor_item_packaging), countsheets (+
-         sections), inventories (+ sections, items, product codes), recipe
-         types, recipes, recipe ingredients, recipe conversions, recipe cost
-         histories, the profit & loss report, and the sales report.
+         categories) - cheap standalone calls, so these always run.
+      3. Decide whether the full-refresh tables are due this run (see
+         `_full_refresh_due` - default weekly, tracked via
+         `state["last_full_refresh"]`).
+      4. For each restaurant unit: incrementally sync orders (with detail,
+         line items, attachments) - always, regardless of the full-refresh
+         cadence, since it's cheap and date-windowed. If full-refresh is due
+         this run, also sync products (which fan out further into
+         product_units, product_price_history, and vendor_items_by_product),
+         categories, vendors (which fan out further into vendor_items and
+         vendor_item_packaging), countsheets (+ sections), inventories (+
+         sections, items, product codes), recipe types, recipes, recipe
+         ingredients, recipe conversions, recipe cost histories, the profit &
+         loss report, and the sales report.
 
     A 403 response from any call is treated as non-retryable and propagates
     up to abort the sync entirely (invalid key or unit not authorized),
@@ -1422,7 +1453,7 @@ def update(configuration: dict, state: dict):
 
     Args:
         configuration: dictionary containing connection details (`api_key`,
-            `initial_sync_start`).
+            `initial_sync_start`, optional `full_refresh_interval_days`).
         state: dictionary containing the state checkpointed during the
             prior sync, or empty for the first sync.
     """
@@ -1436,6 +1467,19 @@ def update(configuration: dict, state: dict):
     _sync_restaurant_unit_group_categories(configuration)
     op.checkpoint(state)
 
+    full_refresh_due = _full_refresh_due(configuration, state)
+    if full_refresh_due:
+        log.info("Full-refresh tables are due this run")
+    else:
+        interval_days = int(
+            configuration.get("full_refresh_interval_days", __DEFAULT_FULL_REFRESH_INTERVAL_DAYS)
+        )
+        log.info(
+            f"Skipping full-refresh tables this run (last refreshed "
+            f"{state.get('last_full_refresh')}, interval is {interval_days} days) - "
+            f"orders still syncs incrementally below"
+        )
+
     for unit in units:
         unit_id = unit.get("id")
         if _is_blank(unit_id):
@@ -1444,23 +1488,27 @@ def update(configuration: dict, state: dict):
 
         log.info(f"Syncing restaurant unit {unit_id} ({unit.get('name')})")
 
-        # Incremental, windowed, checkpoints internally per window.
+        # Incremental, windowed, checkpoints internally per window. Always runs.
         _sync_orders_for_unit(configuration, unit_id, state)
 
-        # Full-refresh tables - re-synced every run since they are not date-filterable.
-        _sync_products_for_unit(configuration, unit_id)
-        _sync_categories_for_unit(configuration, unit_id)
-        _sync_vendors_for_unit(configuration, unit_id)
-        _sync_countsheets_for_unit(configuration, unit_id)
-        _sync_inventories_for_unit(configuration, unit_id)
-        _sync_recipe_types_for_unit(configuration, unit_id)
-        _sync_recipes_for_unit(configuration, unit_id)
-        _sync_recipe_ingredients_for_unit(configuration, unit_id)
-        _sync_recipe_conversions_for_unit(configuration, unit_id)
-        _sync_recipe_cost_histories_for_unit(configuration, unit_id)
-        _sync_profit_and_loss_for_unit(configuration, unit_id)
-        _sync_sales_report_for_unit(configuration, unit_id)
+        if full_refresh_due:
+            _sync_products_for_unit(configuration, unit_id)
+            _sync_categories_for_unit(configuration, unit_id)
+            _sync_vendors_for_unit(configuration, unit_id)
+            _sync_countsheets_for_unit(configuration, unit_id)
+            _sync_inventories_for_unit(configuration, unit_id)
+            _sync_recipe_types_for_unit(configuration, unit_id)
+            _sync_recipes_for_unit(configuration, unit_id)
+            _sync_recipe_ingredients_for_unit(configuration, unit_id)
+            _sync_recipe_conversions_for_unit(configuration, unit_id)
+            _sync_recipe_cost_histories_for_unit(configuration, unit_id)
+            _sync_profit_and_loss_for_unit(configuration, unit_id)
+            _sync_sales_report_for_unit(configuration, unit_id)
 
+        op.checkpoint(state)
+
+    if full_refresh_due:
+        state["last_full_refresh"] = datetime.now(timezone.utc).date().isoformat()
         op.checkpoint(state)
 
     log.info("MarginEdge sync complete")

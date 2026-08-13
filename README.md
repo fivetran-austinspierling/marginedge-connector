@@ -39,12 +39,14 @@ Please verify the following while running `fivetran debug` and report back what 
 - [ ] Row counts across `restaurant_units`, `products`, `vendors`, `categories` roughly match what you'd expect from the account being tested (confirms the `restaurantUnitId` fan-out is discovering everything it should)
 - [ ] Note how long the initial sync takes — the per-product fan-out (`product_units`, `product_price_history`, `vendor_items_by_product`) roughly triples the API call count for large product catalogs, so first-run duration is worth watching on accounts with many products
 - [ ] Re-run `fivetran debug` a second time (without `fivetran reset` in between - reset wipes the checkpointed state and forces a full re-sync by design) and confirm the `orders` incremental logic doesn't re-sync the entire history
+- [ ] Note that this second run will likely show far fewer rows for everything *except* `orders` - by design, the 34 non-`orders` tables only full-refresh once per `full_refresh_interval_days` (default weekly), so a same-day re-run should log "Skipping full-refresh tables this run" rather than re-fetching them. Set `full_refresh_interval_days` to `0` in configuration if you want every local test run to force a full refresh instead
 
 ## Features
 
 - Discovers restaurant units at runtime (`GET /restaurantUnits`) and fans that list out to every restaurant-scoped endpoint (orders, products, vendors, categories, countsheets, inventories, recipes, profit & loss and sales reports), so it never needs a restaurant unit ID supplied in configuration
 - Further fans out from vendors to vendor items, and from vendor items to vendor item packaging; and from products to product units, product price history, and vendor-items-by-product
-- Incremental sync of `orders` via monthly date windows and per-restaurant-unit checkpointed state; all other tables are full-refreshed each run since they are not date-filterable
+- Incremental sync of `orders` via monthly date windows and per-restaurant-unit checkpointed state, on every scheduled sync regardless of the full-refresh cadence below
+- All other tables (34 of 35) are not date-filterable and are full-refreshed on a configurable cadence (default weekly, see `full_refresh_interval_days` below) rather than on every scheduled sync - deep fan-outs like `product_units`/`vendor_item_packaging` make a full sweep expensive on a large catalog, and this data doesn't change fast enough to justify re-fetching it every run
 - Deliberately excludes MarginEdge's async `/exports/*` job endpoints (orders/products/vendor-items/usage/recipes/recipeIngredients/recipeCostHistories exports) - submitting an export is a side-effecting POST that creates a job on the client's account rather than a pure read, and the downloaded file's schema (especially for `usage`, which has no direct GET equivalent) is undocumented
 - Cursor-based (`nextPage`) pagination on every list endpoint
 - Order detail enrichment merged into the same `orders` row, plus nested `lineItems` and `attachments` flattened into child tables
@@ -59,6 +61,7 @@ This connector requires the following configuration fields:
 |---|---|
 | `api_key` | MarginEdge Public API key, sent as the `x-api-key` header on every request |
 | `initial_sync_start` | `YYYY-MM-DD` date used to seed the first incremental window for the `orders` table when no prior sync state exists |
+| `full_refresh_interval_days` | Optional (default `7`). Minimum number of days between full-refresh sweeps of the 34 non-`orders` tables. `orders` always syncs on every scheduled run regardless of this setting. Set to `0` to full-refresh on every run (the connector's original behavior) if you'd rather trade sync duration/API load for maximum freshness on that data - `1` is *not* equivalent to "every run" if your sync schedule runs more than once a day, since the check is day-granularity. |
 
 Example `configuration.json` (placeholder values only):
 
@@ -98,9 +101,9 @@ The connector performs the following actions for each key aspect:
 - Discovery: fetches `restaurantUnits` once per sync and reuses that list to drive every restaurant-scoped table, instead of re-fetching per table
 - Pagination: follows the opaque `nextPage` cursor on every list endpoint until it is absent from the response
 - Orders sync loop: walks forward in ~30-day date windows from the last checkpointed date (or `initial_sync_start`) through today, per restaurant unit; each order found is enriched via its detail endpoint and its nested `lineItems`/`attachments` are flattened into child tables
-- Static tables (`products`, `vendors`, `vendor_items`, `vendor_item_packaging`, `categories`, `restaurant_unit_groups`, `restaurant_unit_group_categories`, and their children) are not date-filterable and are re-synced in full every run
+- Static tables (`products`, `vendors`, `vendor_items`, `vendor_item_packaging`, `categories`, `countsheets`, `inventories`, `recipes`, the reports, and their children) are not date-filterable, so instead of re-syncing in full on every scheduled run, they're swept once per `full_refresh_interval_days` (default weekly) - see [Configuration file](#configuration-file). `restaurant_units`, `restaurant_unit_groups`, and `restaurant_unit_group_categories` are cheap standalone calls (no deep fan-out) and always run every sync regardless, since `restaurant_units` also drives the per-unit loop itself
 - Upserts: emits all data via `op.upsert()`
-- Checkpointing: checkpoints after restaurant-unit discovery, after account-level tables, after each orders date window (per restaurant unit), and after each restaurant unit's static tables finish
+- Checkpointing: checkpoints after restaurant-unit discovery, after account-level tables, after each orders date window (per restaurant unit), after each restaurant unit's full-refresh tables finish (when due), and once more after `state["last_full_refresh"]` is updated
 
 ## Error handling
 

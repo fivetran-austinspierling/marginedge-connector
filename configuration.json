@@ -1,4 +1,5 @@
 {
   "api_key": "YOUR_MARGINEDGE_API_KEY_HERE",
-  "initial_sync_start": "2023-01-01"
+  "initial_sync_start": "2023-01-01",
+  "full_refresh_interval_days": "7"
 }
